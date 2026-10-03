@@ -72,3 +72,9 @@ uint32_t getStaticIntFieldJni(JNIEnv* env, const char* cls_name, const char* fie
 void companionSendFile(const char* path, int remote_fd);
 
 bool readFullFromFd(int fd, void* buf, off_t size);
+
+// --- own GOT inspection / patching (fallback when the zygisk plt hook is a silent no-op)
+#include <stddef.h>
+bool findLibBase(const char* lib_name, uintptr_t* base, ino_t* inode, dev_t* dev, char* path, size_t path_sz);
+int findGotSlots(uintptr_t base, const char* symbol, void*** out, int max);
+bool patchGotSlot(void** slot, void* new_val);

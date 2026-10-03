@@ -119,6 +119,46 @@ int transact_hook(void* self, int32_t handle, uint32_t code, void* pdata, void* 
     return transact_orig(self, handle, code, pdata, preply, flags);
 }
 
+
+// zygisk's pltHook can silently do nothing on some setups: verify the GOT slot ourselves and patch it if needed.
+static bool ensureHooked(const char* sym) {
+    uintptr_t base = 0;
+    ino_t inode = 0;
+    dev_t dev = 0;
+    char path[160] = "";
+    if (!findLibBase("libbinder.so", &base, &inode, &dev, path, sizeof(path))) {
+        LOGD("ERROR ensureHooked: libbinder base not found");
+        return false;
+    }
+    void** slots[4] = {nullptr, nullptr, nullptr, nullptr};
+    int n = findGotSlots(base, sym, slots, 4);
+    LOGD("libbinder path=%s base=%p inode=%lu dev=%lx slots=%d", path, (void*)base, (unsigned long)inode,
+         (unsigned long)dev, n);
+    if (n == 0) {
+        LOGD("ERROR ensureHooked: no GOT slot for transact in libbinder");
+        return false;
+    }
+    bool ok = false;
+    for (int i = 0; i < n; i++) {
+        void* cur = *slots[i];
+        LOGD("slot[%d]=%p value=%p hook=%p orig=%p", i, (void*)slots[i], cur, (void*)transact_hook,
+             (void*)transact_orig);
+        if (cur == (void*)transact_hook) {
+            LOGD("slot[%d] already hooked (zygisk plt hook worked)", i);
+            ok = true;
+            continue;
+        }
+        if (transact_orig == nullptr) transact_orig = (decltype(transact_orig))cur;
+        if (patchGotSlot(slots[i], (void*)transact_hook) && *slots[i] == (void*)transact_hook) {
+            LOGD("slot[%d] patched manually", i);
+            ok = true;
+        } else {
+            LOGD("ERROR slot[%d] manual patch failed", i);
+        }
+    }
+    return ok;
+}
+
 static size_t read_companion(int fd) {
     off_t size;
     if (read(fd, &size, sizeof(size)) < 0) {
@@ -167,12 +207,12 @@ static bool runPostSpecialize(const char* process, zygisk::Api* api, JNIEnv* env
         return false;
     }
 
-    api->pltHookRegister(dev, inode, "_ZN7android14IPCThreadState8transactEijRKNS_6ParcelEPS1_j",
-                         (void**)&transact_hook, (void**)&transact_orig);
+    static const char* TRANSACT_SYM = "_ZN7android14IPCThreadState8transactEijRKNS_6ParcelEPS1_j";
+    api->pltHookRegister(dev, inode, TRANSACT_SYM, (void**)&transact_hook, (void**)&transact_orig);
     if (!api->pltHookCommit()) {
-        LOGD("ERROR: pltHookCommit");
-        return false;
+        LOGD("WARN: pltHookCommit failed, will try manual GOT patch");
     }
+    if (!ensureHooked(TRANSACT_SYM)) return false;
 
     LOGD("Loaded %s (sdk=%d hdr=%zu code=%u)", process, sdk, HEADERS_LEN, getApplicationEnabledSetting_code);
     return true;
