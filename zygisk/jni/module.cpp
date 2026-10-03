@@ -24,23 +24,75 @@ static char* DETACH_TXT = nullptr;
 static size_t HEADERS_LEN = 0;
 static uint32_t getApplicationEnabledSetting_code = 0;
 
+#ifndef DETACH_DEBUG
+#define DETACH_DEBUG 1
+#endif
+
+#if DETACH_DEBUG
+static int dbg_calls = 0;       // total hook invocations
+static int dbg_raw_budget = 40; // raw parcel dumps (any descriptor)
+static int dbg_pm_budget = 300; // IPackageManager transactions
+
+static void dbg_u16_to_ascii(const char16_t* s, uint32_t len, char* out, size_t outsz) {
+    size_t n = len < outsz - 1 ? len : outsz - 1;
+    for (size_t i = 0; i < n; i++) out[i] = s[i] < 128 && s[i] >= 32 ? (char)s[i] : '?';
+    out[n] = 0;
+}
+#endif
+
 static inline void detach(PParcel* pparcel, uint32_t code) {
+    if (pparcel == nullptr || pparcel->data == nullptr) return;
+    size_t dsz = pparcel->data_size;
+
+#if DETACH_DEBUG
+    dbg_calls++;
+    if (dbg_calls == 1 || dbg_calls == 100 || dbg_calls == 1000 || dbg_calls == 10000) {
+        LOGD("hook alive: calls=%d", dbg_calls);
+    }
+    if (dbg_raw_budget > 0) {
+        dbg_raw_budget--;
+        uint32_t w[16] = {0};
+        size_t n = dsz < sizeof(w) ? dsz : sizeof(w);
+        memcpy(w, pparcel->data, n);
+        LOGD("raw code=%u size=%zu err=%zu hdr=%zu: %08x %08x %08x %08x %08x %08x %08x %08x", code, dsz,
+             pparcel->error, HEADERS_LEN, w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
+    }
+#endif
+
+    if (dsz < HEADERS_LEN + 4) return;
     auto parcel = FakeParcel(pparcel->data);
-    if (pparcel->data_size < HEADERS_LEN + 4) return;
     parcel.skip(HEADERS_LEN);  // header
 
     auto descLen = parcel.readInt32();
+    if (descLen != STR_LEN(PM_DESC)) return;
+    // header + len + desc(+null, padded to 4) + 2nd len must fit
+    if (dsz < HEADERS_LEN + 4 + (descLen + 1) * sizeof(char16_t) + 2 + 4) return;
     auto desc = parcel.readString16(descLen);
+    if (memcmp(desc, PM_DESC, descLen * sizeof(char16_t)) != 0) return;
 
-    if (code != getApplicationEnabledSetting_code ||
-        STR_LEN(PM_DESC) != descLen ||
-        memcmp(desc, PM_DESC, descLen * sizeof(char16_t)) != 0) {
-        return;
+#if DETACH_DEBUG
+    if (dbg_pm_budget > 0) {
+        dbg_pm_budget--;
+        LOGD("IPackageManager transaction code=%u (want %u) size=%zu", code, getApplicationEnabledSetting_code, dsz);
     }
+#endif
+
+    if (code != getApplicationEnabledSetting_code) return;
     parcel.skip(2);
 
+    size_t cur = parcel.getCursor();
+    if (dsz < cur + 4) return;
     auto pkgLen = parcel.readInt32();
+    if (pkgLen == 0 || pkgLen > 255 || dsz < cur + 4 + (pkgLen + 1) * sizeof(char16_t)) return;
     auto pkg = parcel.readString16(pkgLen);
+
+#if DETACH_DEBUG
+    {
+        char buf[128];
+        dbg_u16_to_ascii(pkg, pkgLen, buf, sizeof(buf));
+        LOGD("getApplicationEnabledSetting pkg='%s' len=%u", buf, pkgLen);
+    }
+#endif
 
     auto pkgLenB = (uint8_t)(pkgLen * 2 - 1);
     size_t i = 0;
@@ -50,6 +102,9 @@ static inline void detach(PParcel* pparcel, uint32_t code) {
         i += sizeof(dlen) + dlen;
         if (dlen != pkgLenB) continue;
         if (memcmp(dptr, pkg, dlen) == 0) {
+#if DETACH_DEBUG
+            LOGD("DETACHED a package");
+#endif
             *pkg = 0;
             return;
         }
@@ -119,7 +174,7 @@ static bool runPostSpecialize(const char* process, zygisk::Api* api, JNIEnv* env
         return false;
     }
 
-    LOGD("Loaded %s", process);
+    LOGD("Loaded %s (sdk=%d hdr=%zu code=%u)", process, sdk, HEADERS_LEN, getApplicationEnabledSetting_code);
     return true;
 }
 
