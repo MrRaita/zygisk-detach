@@ -3,13 +3,13 @@
 #include <android/log.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/sendfile.h>
 #include <sys/stat.h>
 #include <sys/sysmacros.h>
 #include <sys/system_properties.h>
-#include <pthread.h>
 #include <unistd.h>
 
 #include "binder.hpp"
@@ -20,88 +20,29 @@
 #define VENDING_PROC "com.android.vending"
 
 #define PM_DESC u"android.content.pm.IPackageManager"
+#define TRANSACT_SYM "_ZN7android14IPCThreadState8transactEijRKNS_6ParcelEPS1_j"
 
 static char* DETACH_TXT = nullptr;
 static size_t HEADERS_LEN = 0;
 static uint32_t getApplicationEnabledSetting_code = 0;
 
-#ifndef DETACH_DEBUG
-#define DETACH_DEBUG 0
-#endif
-
-#if DETACH_DEBUG
-#define DBGLOG(...) LOGD(__VA_ARGS__)
-#else
-#define DBGLOG(...) ((void)0)
-#endif
-
-#if DETACH_DEBUG
-static int dbg_raw_budget = 40; // raw parcel dumps (any descriptor)
-static int dbg_pm_budget = 300; // IPackageManager transactions
-
-static void dbg_u16_to_ascii(const char16_t* s, uint32_t len, char* out, size_t outsz) {
-    size_t n = len < outsz - 1 ? len : outsz - 1;
-    for (size_t i = 0; i < n; i++) out[i] = s[i] < 128 && s[i] >= 32 ? (char)s[i] : '?';
-    out[n] = 0;
-}
-#endif
-
-[[maybe_unused]] static int g_calls[1] = {0};
-[[maybe_unused]] static const char* const SRC_NAME[1] = {"got"};
-
-static inline void detach(PParcel* pparcel, uint32_t code, [[maybe_unused]] int src) {
-    if (pparcel == nullptr || pparcel->data == nullptr) return;
-    size_t dsz = pparcel->data_size;
-
-#if DETACH_DEBUG
-    int cnt = __atomic_add_fetch(&g_calls[src], 1, __ATOMIC_RELAXED);
-    if (cnt == 1 || cnt == 100 || cnt == 1000 || cnt == 10000) {
-        LOGD("hook alive [%s]: calls=%d", SRC_NAME[src], cnt);
-    }
-    if (__atomic_load_n(&dbg_raw_budget, __ATOMIC_RELAXED) > 0) {
-        __atomic_sub_fetch(&dbg_raw_budget, 1, __ATOMIC_RELAXED);
-        uint32_t w[16] = {0};
-        size_t n = dsz < sizeof(w) ? dsz : sizeof(w);
-        memcpy(w, pparcel->data, n);
-        LOGD("raw code=%u size=%zu err=%zu hdr=%zu: %08x %08x %08x %08x %08x %08x %08x %08x", code, dsz,
-             pparcel->error, HEADERS_LEN, w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
-    }
-#endif
-
-    if (dsz < HEADERS_LEN + 4) return;
+static inline void detach(PParcel* pparcel, uint32_t code) {
     auto parcel = FakeParcel(pparcel->data);
+    if (pparcel->data_size < HEADERS_LEN + 4) return;
     parcel.skip(HEADERS_LEN);  // header
 
     auto descLen = parcel.readInt32();
-    if (descLen != STR_LEN(PM_DESC)) return;
-    // header + len + desc(+null, padded to 4) + 2nd len must fit
-    if (dsz < HEADERS_LEN + 4 + (descLen + 1) * sizeof(char16_t) + 2 + 4) return;
     auto desc = parcel.readString16(descLen);
-    if (memcmp(desc, PM_DESC, descLen * sizeof(char16_t)) != 0) return;
 
-#if DETACH_DEBUG
-    if (dbg_pm_budget > 0) {
-        dbg_pm_budget--;
-        LOGD("IPackageManager transaction code=%u (want %u) size=%zu", code, getApplicationEnabledSetting_code, dsz);
+    if (code != getApplicationEnabledSetting_code ||
+        STR_LEN(PM_DESC) != descLen ||
+        memcmp(desc, PM_DESC, descLen * sizeof(char16_t)) != 0) {
+        return;
     }
-#endif
-
-    if (code != getApplicationEnabledSetting_code) return;
     parcel.skip(2);
 
-    size_t cur = parcel.getCursor();
-    if (dsz < cur + 4) return;
     auto pkgLen = parcel.readInt32();
-    if (pkgLen == 0 || pkgLen > 255 || dsz < cur + 4 + (pkgLen + 1) * sizeof(char16_t)) return;
     auto pkg = parcel.readString16(pkgLen);
-
-#if DETACH_DEBUG
-    {
-        char buf[128];
-        dbg_u16_to_ascii(pkg, pkgLen, buf, sizeof(buf));
-        LOGD("getApplicationEnabledSetting pkg='%s' len=%u", buf, pkgLen);
-    }
-#endif
 
     auto pkgLenB = (uint8_t)(pkgLen * 2 - 1);
     size_t i = 0;
@@ -111,9 +52,6 @@ static inline void detach(PParcel* pparcel, uint32_t code, [[maybe_unused]] int 
         i += sizeof(dlen) + dlen;
         if (dlen != pkgLenB) continue;
         if (memcmp(dptr, pkg, dlen) == 0) {
-#if DETACH_DEBUG
-            LOGD("DETACHED a package");
-#endif
             *pkg = 0;
             return;
         }
@@ -124,89 +62,23 @@ int (*transact_orig)(void*, int32_t, uint32_t, void*, void*, uint32_t);
 
 int transact_hook(void* self, int32_t handle, uint32_t code, void* pdata, void* preply, uint32_t flags) {
     auto parcel = (PParcel*)pdata;
-    detach(parcel, code, 0);
+    detach(parcel, code);
     return transact_orig(self, handle, code, pdata, preply, flags);
 }
 
+static GotSlot transact_slot;
 
-static void** g_got_slot = nullptr;
-
-// Something (zygisk's own cleanup after specialization, as far as the logs show) puts the original GOT value back
-// shortly after we hooked it. Keep an eye on the slot and re-apply the hook whenever it was reverted.
-static void* watcher(void*) {
-    static const int log_at_s[] = {3, 10, 30};
-    int repatched = 0;
-    long elapsed_ms = 0;
-    size_t next_log = 0;
-    while (true) {
-        long step = elapsed_ms < 5000 ? 20 : (elapsed_ms < 65000 ? 200 : 2000);
-        usleep(step * 1000);
-        elapsed_ms += step;
-        if (g_got_slot) {
-            void* cur = __atomic_load_n(g_got_slot, __ATOMIC_RELAXED);
-            if (cur != (void*)transact_hook) {
-                if (cur != (void*)transact_orig) transact_orig = (decltype(transact_orig))cur;
-                [[maybe_unused]] bool ok = patchGotSlot(g_got_slot, (void*)transact_hook);
-                repatched++;
-                if (repatched <= 20) {
-                    DBGLOG("slot was reverted (value=%p) at t=%ldms -> re-patched ok=%d (#%d)", cur, elapsed_ms, ok,
-                         repatched);
-                }
-            }
+// The PLT hook is reverted shortly after the app is specialized (seen with ReZygisk on Android 16),
+// so put it back if the slot holds the original function again.
+static void* keepHooked(void*) {
+    for (int i = 0; i < 500; i++) {
+        if (__atomic_load_n(transact_slot.addr, __ATOMIC_RELAXED) == (void*)transact_orig) {
+            LOGD("transact hook was reverted, hooking again");
+            writeGotSlot(transact_slot, (void*)transact_hook);
         }
-        if (next_log < sizeof(log_at_s) / sizeof(log_at_s[0]) && elapsed_ms >= log_at_s[next_log] * 1000L) {
-            DBGLOG("watch t=%ds calls=%d repatched=%d got_slot_value=%p (hook=%p)", log_at_s[next_log],
-                 __atomic_load_n(&g_calls[0], __ATOMIC_RELAXED), repatched,
-                 g_got_slot ? *g_got_slot : nullptr, (void*)transact_hook);
-            next_log++;
-        }
+        usleep(20 * 1000);
     }
     return nullptr;
-}
-
-// zygisk's pltHook can silently do nothing on some setups: verify the GOT slot ourselves and patch it if needed.
-static bool ensureHooked(const char* sym) {
-    uintptr_t base = 0;
-    ino_t inode = 0;
-    dev_t dev = 0;
-    char path[160] = "";
-    if (!findLibBase("libbinder.so", &base, &inode, &dev, path, sizeof(path))) {
-        LOGD("ERROR ensureHooked: libbinder base not found");
-        return false;
-    }
-    void** slots[4] = {nullptr, nullptr, nullptr, nullptr};
-    int n = findGotSlots(base, sym, slots, 4);
-    DBGLOG("libbinder path=%s base=%p inode=%lu dev=%lx slots=%d", path, (void*)base, (unsigned long)inode,
-         (unsigned long)dev, n);
-    if (n == 0) {
-        LOGD("ERROR ensureHooked: no GOT slot for transact in libbinder");
-        return false;
-    }
-    bool ok = false;
-    for (int i = 0; i < n; i++) {
-        void* cur = *slots[i];
-        DBGLOG("slot[%d]=%p value=%p hook=%p orig=%p", i, (void*)slots[i], cur, (void*)transact_hook,
-             (void*)transact_orig);
-        if (cur == (void*)transact_hook) {
-            DBGLOG("slot[%d] already hooked (zygisk plt hook worked)", i);
-            if (!g_got_slot) g_got_slot = slots[i];
-            ok = true;
-            continue;
-        }
-        if (transact_orig == nullptr) transact_orig = (decltype(transact_orig))cur;
-        if (patchGotSlot(slots[i], (void*)transact_hook) && *slots[i] == (void*)transact_hook) {
-            DBGLOG("slot[%d] patched manually", i);
-            if (!g_got_slot) g_got_slot = slots[i];
-            ok = true;
-        } else {
-            LOGD("ERROR slot[%d] manual patch failed", i);
-        }
-    }
-    if (ok) {
-        pthread_t th;
-        if (pthread_create(&th, nullptr, watcher, nullptr) == 0) pthread_detach(th);
-    }
-    return ok;
 }
 
 static size_t read_companion(int fd) {
@@ -257,14 +129,20 @@ static bool runPostSpecialize(const char* process, zygisk::Api* api, JNIEnv* env
         return false;
     }
 
-    static const char* TRANSACT_SYM = "_ZN7android14IPCThreadState8transactEijRKNS_6ParcelEPS1_j";
     api->pltHookRegister(dev, inode, TRANSACT_SYM, (void**)&transact_hook, (void**)&transact_orig);
     if (!api->pltHookCommit()) {
-        LOGD("WARN: pltHookCommit failed, will try manual GOT patch");
+        LOGD("ERROR: pltHookCommit");
+        return false;
     }
-    if (!ensureHooked(TRANSACT_SYM)) return false;
 
-    LOGD("Loaded %s (sdk=%d hdr=%zu code=%u)", process, sdk, HEADERS_LEN, getApplicationEnabledSetting_code);
+    if (findGotSlot("libbinder.so", TRANSACT_SYM, &transact_slot)) {
+        pthread_t thread;
+        if (pthread_create(&thread, nullptr, keepHooked, nullptr) == 0) pthread_detach(thread);
+    } else {
+        LOGD("ERROR: Could not find the GOT slot of transact");
+    }
+
+    LOGD("Loaded %s", process);
     return true;
 }
 

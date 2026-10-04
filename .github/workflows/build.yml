@@ -1,8 +1,6 @@
-name: build-a16-debug
+name: build-test-zip
 on:
   workflow_dispatch:
-  push:
-    paths: ['zygisk/**', '.github/workflows/build.yml']
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -19,9 +17,9 @@ jobs:
           for abi in arm64-v8a armeabi-v7a x86 x86_64; do
             cp "../zygisk/libs/$abi/libzygisk-detach.so" "zygisk/$abi.so"
           done
-          sed -i -e 's/^version=.*/version=v1.24.0-a16fix/' -e '/^updateJson=/d' module.prop
-          zip -qr ../zygisk-detach-a16-debug.zip .
+          sed -i -e 's/^version=.*/version=v1.24.0-a16clean/' -e '/^updateJson=/d' module.prop
+          zip -qr ../zygisk-detach-a16-clean.zip .
       - uses: actions/upload-artifact@v4
         with:
-          name: zygisk-detach-a16-debug
-          path: zygisk-detach-a16-debug.zip
+          name: zygisk-detach-a16-clean
+          path: zygisk-detach-a16-clean.zip
