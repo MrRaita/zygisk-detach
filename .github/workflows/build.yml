@@ -19,7 +19,7 @@ jobs:
           for abi in arm64-v8a armeabi-v7a x86 x86_64; do
             cp "../zygisk/libs/$abi/libzygisk-detach.so" "zygisk/$abi.so"
           done
-          sed -i -e 's/^version=.*/version=v1.24.0-a16debug3/' -e '/^updateJson=/d' module.prop
+          sed -i -e 's/^version=.*/version=v1.24.0-a16debug4/' -e '/^updateJson=/d' module.prop
           zip -qr ../zygisk-detach-a16-debug.zip .
       - uses: actions/upload-artifact@v4
         with:

@@ -125,15 +125,35 @@ int transact_hook(void* self, int32_t handle, uint32_t code, void* pdata, void* 
 
 static void** g_got_slot = nullptr;
 
+// Something (zygisk's own cleanup after specialization, as far as the logs show) puts the original GOT value back
+// shortly after we hooked it. Keep an eye on the slot and re-apply the hook whenever it was reverted.
 static void* watcher(void*) {
-    static const int ts[] = {3, 10, 30};
-    int prev = 0;
-    for (int t : ts) {
-        sleep(t - prev);
-        prev = t;
-        LOGD("watch t=%ds calls=%d got_slot_value=%p (hook=%p orig=%p)", t,
-             __atomic_load_n(&g_calls[0], __ATOMIC_RELAXED), g_got_slot ? *g_got_slot : nullptr,
-             (void*)transact_hook, (void*)transact_orig);
+    static const int log_at_s[] = {3, 10, 30};
+    int repatched = 0;
+    long elapsed_ms = 0;
+    size_t next_log = 0;
+    while (true) {
+        long step = elapsed_ms < 5000 ? 20 : (elapsed_ms < 65000 ? 200 : 2000);
+        usleep(step * 1000);
+        elapsed_ms += step;
+        if (g_got_slot) {
+            void* cur = __atomic_load_n(g_got_slot, __ATOMIC_RELAXED);
+            if (cur != (void*)transact_hook) {
+                if (cur != (void*)transact_orig) transact_orig = (decltype(transact_orig))cur;
+                bool ok = patchGotSlot(g_got_slot, (void*)transact_hook);
+                repatched++;
+                if (repatched <= 20) {
+                    LOGD("slot was reverted (value=%p) at t=%ldms -> re-patched ok=%d (#%d)", cur, elapsed_ms, ok,
+                         repatched);
+                }
+            }
+        }
+        if (next_log < sizeof(log_at_s) / sizeof(log_at_s[0]) && elapsed_ms >= log_at_s[next_log] * 1000L) {
+            LOGD("watch t=%ds calls=%d repatched=%d got_slot_value=%p (hook=%p)", log_at_s[next_log],
+                 __atomic_load_n(&g_calls[0], __ATOMIC_RELAXED), repatched,
+                 g_got_slot ? *g_got_slot : nullptr, (void*)transact_hook);
+            next_log++;
+        }
     }
     return nullptr;
 }
