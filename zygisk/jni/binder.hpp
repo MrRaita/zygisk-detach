@@ -67,6 +67,15 @@ inline size_t getBinderHeadersLen(int sdk) {
 
 bool getMapping(const char* lib, ino_t* inode, dev_t* dev);
 
+struct GotSlot {
+    void** addr;
+    bool relro;
+};
+
+bool findGotSlot(const char* lib, const char* symbol, GotSlot* slot);
+
+bool writeGotSlot(const GotSlot& slot, void* value);
+
 uint32_t getStaticIntFieldJni(JNIEnv* env, const char* cls_name, const char* field_name);
 
 void companionSendFile(const char* path, int remote_fd);

@@ -3,6 +3,7 @@
 #include <android/log.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/sendfile.h>
@@ -19,6 +20,7 @@
 #define VENDING_PROC "com.android.vending"
 
 #define PM_DESC u"android.content.pm.IPackageManager"
+#define TRANSACT_SYM "_ZN7android14IPCThreadState8transactEijRKNS_6ParcelEPS1_j"
 
 static char* DETACH_TXT = nullptr;
 static size_t HEADERS_LEN = 0;
@@ -62,6 +64,21 @@ int transact_hook(void* self, int32_t handle, uint32_t code, void* pdata, void* 
     auto parcel = (PParcel*)pdata;
     detach(parcel, code);
     return transact_orig(self, handle, code, pdata, preply, flags);
+}
+
+static GotSlot transact_slot;
+
+// The PLT hook is reverted shortly after the app is specialized (seen with ReZygisk on Android 16),
+// so put it back if the slot holds the original function again.
+static void* keepHooked(void*) {
+    for (int i = 0; i < 500; i++) {
+        if (__atomic_load_n(transact_slot.addr, __ATOMIC_RELAXED) == (void*)transact_orig) {
+            LOGD("transact hook was reverted, hooking again");
+            writeGotSlot(transact_slot, (void*)transact_hook);
+        }
+        usleep(20 * 1000);
+    }
+    return nullptr;
 }
 
 static size_t read_companion(int fd) {
@@ -112,11 +129,17 @@ static bool runPostSpecialize(const char* process, zygisk::Api* api, JNIEnv* env
         return false;
     }
 
-    api->pltHookRegister(dev, inode, "_ZN7android14IPCThreadState8transactEijRKNS_6ParcelEPS1_j",
-                         (void**)&transact_hook, (void**)&transact_orig);
+    api->pltHookRegister(dev, inode, TRANSACT_SYM, (void**)&transact_hook, (void**)&transact_orig);
     if (!api->pltHookCommit()) {
         LOGD("ERROR: pltHookCommit");
         return false;
+    }
+
+    if (findGotSlot("libbinder.so", TRANSACT_SYM, &transact_slot)) {
+        pthread_t thread;
+        if (pthread_create(&thread, nullptr, keepHooked, nullptr) == 0) pthread_detach(thread);
+    } else {
+        LOGD("ERROR: Could not find the GOT slot of transact");
     }
 
     LOGD("Loaded %s", process);
