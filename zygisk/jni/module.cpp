@@ -26,7 +26,13 @@ static size_t HEADERS_LEN = 0;
 static uint32_t getApplicationEnabledSetting_code = 0;
 
 #ifndef DETACH_DEBUG
-#define DETACH_DEBUG 1
+#define DETACH_DEBUG 0
+#endif
+
+#if DETACH_DEBUG
+#define DBGLOG(...) LOGD(__VA_ARGS__)
+#else
+#define DBGLOG(...) ((void)0)
 #endif
 
 #if DETACH_DEBUG
@@ -40,10 +46,10 @@ static void dbg_u16_to_ascii(const char16_t* s, uint32_t len, char* out, size_t 
 }
 #endif
 
-static int g_calls[1] = {0};
-static const char* const SRC_NAME[1] = {"got"};
+[[maybe_unused]] static int g_calls[1] = {0};
+[[maybe_unused]] static const char* const SRC_NAME[1] = {"got"};
 
-static inline void detach(PParcel* pparcel, uint32_t code, int src) {
+static inline void detach(PParcel* pparcel, uint32_t code, [[maybe_unused]] int src) {
     if (pparcel == nullptr || pparcel->data == nullptr) return;
     size_t dsz = pparcel->data_size;
 
@@ -140,16 +146,16 @@ static void* watcher(void*) {
             void* cur = __atomic_load_n(g_got_slot, __ATOMIC_RELAXED);
             if (cur != (void*)transact_hook) {
                 if (cur != (void*)transact_orig) transact_orig = (decltype(transact_orig))cur;
-                bool ok = patchGotSlot(g_got_slot, (void*)transact_hook);
+                [[maybe_unused]] bool ok = patchGotSlot(g_got_slot, (void*)transact_hook);
                 repatched++;
                 if (repatched <= 20) {
-                    LOGD("slot was reverted (value=%p) at t=%ldms -> re-patched ok=%d (#%d)", cur, elapsed_ms, ok,
+                    DBGLOG("slot was reverted (value=%p) at t=%ldms -> re-patched ok=%d (#%d)", cur, elapsed_ms, ok,
                          repatched);
                 }
             }
         }
         if (next_log < sizeof(log_at_s) / sizeof(log_at_s[0]) && elapsed_ms >= log_at_s[next_log] * 1000L) {
-            LOGD("watch t=%ds calls=%d repatched=%d got_slot_value=%p (hook=%p)", log_at_s[next_log],
+            DBGLOG("watch t=%ds calls=%d repatched=%d got_slot_value=%p (hook=%p)", log_at_s[next_log],
                  __atomic_load_n(&g_calls[0], __ATOMIC_RELAXED), repatched,
                  g_got_slot ? *g_got_slot : nullptr, (void*)transact_hook);
             next_log++;
@@ -170,7 +176,7 @@ static bool ensureHooked(const char* sym) {
     }
     void** slots[4] = {nullptr, nullptr, nullptr, nullptr};
     int n = findGotSlots(base, sym, slots, 4);
-    LOGD("libbinder path=%s base=%p inode=%lu dev=%lx slots=%d", path, (void*)base, (unsigned long)inode,
+    DBGLOG("libbinder path=%s base=%p inode=%lu dev=%lx slots=%d", path, (void*)base, (unsigned long)inode,
          (unsigned long)dev, n);
     if (n == 0) {
         LOGD("ERROR ensureHooked: no GOT slot for transact in libbinder");
@@ -179,17 +185,17 @@ static bool ensureHooked(const char* sym) {
     bool ok = false;
     for (int i = 0; i < n; i++) {
         void* cur = *slots[i];
-        LOGD("slot[%d]=%p value=%p hook=%p orig=%p", i, (void*)slots[i], cur, (void*)transact_hook,
+        DBGLOG("slot[%d]=%p value=%p hook=%p orig=%p", i, (void*)slots[i], cur, (void*)transact_hook,
              (void*)transact_orig);
         if (cur == (void*)transact_hook) {
-            LOGD("slot[%d] already hooked (zygisk plt hook worked)", i);
+            DBGLOG("slot[%d] already hooked (zygisk plt hook worked)", i);
             if (!g_got_slot) g_got_slot = slots[i];
             ok = true;
             continue;
         }
         if (transact_orig == nullptr) transact_orig = (decltype(transact_orig))cur;
         if (patchGotSlot(slots[i], (void*)transact_hook) && *slots[i] == (void*)transact_hook) {
-            LOGD("slot[%d] patched manually", i);
+            DBGLOG("slot[%d] patched manually", i);
             if (!g_got_slot) g_got_slot = slots[i];
             ok = true;
         } else {
