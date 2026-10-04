@@ -9,6 +9,7 @@
 #include <sys/stat.h>
 #include <sys/sysmacros.h>
 #include <sys/system_properties.h>
+#include <pthread.h>
 #include <unistd.h>
 
 #include "binder.hpp"
@@ -29,7 +30,6 @@ static uint32_t getApplicationEnabledSetting_code = 0;
 #endif
 
 #if DETACH_DEBUG
-static int dbg_calls = 0;       // total hook invocations
 static int dbg_raw_budget = 40; // raw parcel dumps (any descriptor)
 static int dbg_pm_budget = 300; // IPackageManager transactions
 
@@ -40,17 +40,20 @@ static void dbg_u16_to_ascii(const char16_t* s, uint32_t len, char* out, size_t 
 }
 #endif
 
-static inline void detach(PParcel* pparcel, uint32_t code) {
+static int g_calls[1] = {0};
+static const char* const SRC_NAME[1] = {"got"};
+
+static inline void detach(PParcel* pparcel, uint32_t code, int src) {
     if (pparcel == nullptr || pparcel->data == nullptr) return;
     size_t dsz = pparcel->data_size;
 
 #if DETACH_DEBUG
-    dbg_calls++;
-    if (dbg_calls == 1 || dbg_calls == 100 || dbg_calls == 1000 || dbg_calls == 10000) {
-        LOGD("hook alive: calls=%d", dbg_calls);
+    int cnt = __atomic_add_fetch(&g_calls[src], 1, __ATOMIC_RELAXED);
+    if (cnt == 1 || cnt == 100 || cnt == 1000 || cnt == 10000) {
+        LOGD("hook alive [%s]: calls=%d", SRC_NAME[src], cnt);
     }
-    if (dbg_raw_budget > 0) {
-        dbg_raw_budget--;
+    if (__atomic_load_n(&dbg_raw_budget, __ATOMIC_RELAXED) > 0) {
+        __atomic_sub_fetch(&dbg_raw_budget, 1, __ATOMIC_RELAXED);
         uint32_t w[16] = {0};
         size_t n = dsz < sizeof(w) ? dsz : sizeof(w);
         memcpy(w, pparcel->data, n);
@@ -115,10 +118,25 @@ int (*transact_orig)(void*, int32_t, uint32_t, void*, void*, uint32_t);
 
 int transact_hook(void* self, int32_t handle, uint32_t code, void* pdata, void* preply, uint32_t flags) {
     auto parcel = (PParcel*)pdata;
-    detach(parcel, code);
+    detach(parcel, code, 0);
     return transact_orig(self, handle, code, pdata, preply, flags);
 }
 
+
+static void** g_got_slot = nullptr;
+
+static void* watcher(void*) {
+    static const int ts[] = {3, 10, 30};
+    int prev = 0;
+    for (int t : ts) {
+        sleep(t - prev);
+        prev = t;
+        LOGD("watch t=%ds calls=%d got_slot_value=%p (hook=%p orig=%p)", t,
+             __atomic_load_n(&g_calls[0], __ATOMIC_RELAXED), g_got_slot ? *g_got_slot : nullptr,
+             (void*)transact_hook, (void*)transact_orig);
+    }
+    return nullptr;
+}
 
 // zygisk's pltHook can silently do nothing on some setups: verify the GOT slot ourselves and patch it if needed.
 static bool ensureHooked(const char* sym) {
@@ -145,16 +163,22 @@ static bool ensureHooked(const char* sym) {
              (void*)transact_orig);
         if (cur == (void*)transact_hook) {
             LOGD("slot[%d] already hooked (zygisk plt hook worked)", i);
+            if (!g_got_slot) g_got_slot = slots[i];
             ok = true;
             continue;
         }
         if (transact_orig == nullptr) transact_orig = (decltype(transact_orig))cur;
         if (patchGotSlot(slots[i], (void*)transact_hook) && *slots[i] == (void*)transact_hook) {
             LOGD("slot[%d] patched manually", i);
+            if (!g_got_slot) g_got_slot = slots[i];
             ok = true;
         } else {
             LOGD("ERROR slot[%d] manual patch failed", i);
         }
+    }
+    if (ok) {
+        pthread_t th;
+        if (pthread_create(&th, nullptr, watcher, nullptr) == 0) pthread_detach(th);
     }
     return ok;
 }

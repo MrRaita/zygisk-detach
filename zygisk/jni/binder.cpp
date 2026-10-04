@@ -166,12 +166,16 @@ typedef ElfW(Rel) Reloc_t;
 #define R_SYM_OF(i) ELF32_R_SYM(i)
 #endif
 
-int findGotSlots(uintptr_t base, const char* symbol, void*** out, int max) {
+struct DynInfo {
+    uintptr_t bias = 0, symtab = 0, strtab = 0, jmprel = 0, rel = 0;
+    size_t pltrelsz = 0, relsz = 0;
+};
+
+static bool parseDyn(uintptr_t base, DynInfo* di) {
     auto eh = (const ElfW(Ehdr)*)base;
-    if (memcmp(eh->e_ident, ELFMAG, SELFMAG) != 0) return 0;
+    if (memcmp(eh->e_ident, ELFMAG, SELFMAG) != 0) return false;
     auto ph = (const ElfW(Phdr)*)(base + eh->e_phoff);
     uintptr_t min_vaddr = (uintptr_t)-1;
-    const ElfW(Dyn)* dyn = nullptr;
     uintptr_t dyn_vaddr = 0;
     for (int i = 0; i < eh->e_phnum; i++) {
         if (ph[i].p_type == PT_LOAD) {
@@ -181,35 +185,36 @@ int findGotSlots(uintptr_t base, const char* symbol, void*** out, int max) {
             dyn_vaddr = ph[i].p_vaddr;
         }
     }
-    if (min_vaddr == (uintptr_t)-1 || dyn_vaddr == 0) return 0;
+    if (min_vaddr == (uintptr_t)-1 || dyn_vaddr == 0) return false;
     uintptr_t bias = base - min_vaddr;
-    dyn = (const ElfW(Dyn)*)(bias + dyn_vaddr);
-
+    di->bias = bias;
+    auto dyn = (const ElfW(Dyn)*)(bias + dyn_vaddr);
     // bionic keeps d_ptr values as link-time vaddrs; be tolerant if they were relocated already
     auto fix = [&](uintptr_t v) -> uintptr_t { return v < base ? v + bias : v; };
-
-    uintptr_t symtab = 0, strtab = 0, jmprel = 0, rel = 0;
-    size_t pltrelsz = 0, relsz = 0;
     for (const ElfW(Dyn)* d = dyn; d->d_tag != DT_NULL; d++) {
         switch (d->d_tag) {
-            case DT_SYMTAB: symtab = fix(d->d_un.d_ptr); break;
-            case DT_STRTAB: strtab = fix(d->d_un.d_ptr); break;
-            case DT_JMPREL: jmprel = fix(d->d_un.d_ptr); break;
-            case DT_PLTRELSZ: pltrelsz = d->d_un.d_val; break;
+            case DT_SYMTAB: di->symtab = fix(d->d_un.d_ptr); break;
+            case DT_STRTAB: di->strtab = fix(d->d_un.d_ptr); break;
+            case DT_JMPREL: di->jmprel = fix(d->d_un.d_ptr); break;
+            case DT_PLTRELSZ: di->pltrelsz = d->d_un.d_val; break;
 #if defined(__LP64__)
-            case DT_RELA: rel = fix(d->d_un.d_ptr); break;
-            case DT_RELASZ: relsz = d->d_un.d_val; break;
+            case DT_RELA: di->rel = fix(d->d_un.d_ptr); break;
+            case DT_RELASZ: di->relsz = d->d_un.d_val; break;
 #else
-            case DT_REL: rel = fix(d->d_un.d_ptr); break;
-            case DT_RELSZ: relsz = d->d_un.d_val; break;
+            case DT_REL: di->rel = fix(d->d_un.d_ptr); break;
+            case DT_RELSZ: di->relsz = d->d_un.d_val; break;
 #endif
             default: break;
         }
     }
-    if (!symtab || !strtab) return 0;
+    return di->symtab && di->strtab;
+}
 
+int findGotSlots(uintptr_t base, const char* symbol, void*** out, int max) {
+    DynInfo di;
+    if (!parseDyn(base, &di)) return 0;
     int count = 0;
-    struct Tab { uintptr_t addr; size_t size; } tabs[2] = {{jmprel, pltrelsz}, {rel, relsz}};
+    struct Tab { uintptr_t addr; size_t size; } tabs[2] = {{di.jmprel, di.pltrelsz}, {di.rel, di.relsz}};
     for (auto& t : tabs) {
         if (!t.addr || !t.size) continue;
         auto r = (const Reloc_t*)t.addr;
@@ -217,10 +222,10 @@ int findGotSlots(uintptr_t base, const char* symbol, void*** out, int max) {
         for (size_t i = 0; i < n; i++) {
             uint32_t si = (uint32_t)R_SYM_OF(r[i].r_info);
             if (si == 0) continue;
-            auto sy = (const ElfW(Sym)*)symtab + si;
-            const char* name = (const char*)strtab + sy->st_name;
+            auto sy = (const ElfW(Sym)*)di.symtab + si;
+            const char* name = (const char*)di.strtab + sy->st_name;
             if (strcmp(name, symbol) != 0) continue;
-            if (count < max) out[count] = (void**)(bias + r[i].r_offset);
+            if (count < max) out[count] = (void**)(di.bias + r[i].r_offset);
             count++;
         }
     }
